@@ -1,7 +1,7 @@
 # PRD.md: REIA Product Requirements Document
 
-Status: Draft v0.2 (Phase 0.2), pending review.
-Sources: REIA Full URD and the Market Expansion Addendum. Where the two differ, the Addendum wins (target markets, languages, currencies).
+Status: Draft v0.3 (Phase 0.2, updated with the Architecture Decision Addendum), pending review.
+Sources: REIA Full URD, the Market Expansion Addendum and the Architecture Decision Addendum. Where documents differ, the later addendum wins.
 Related documents: SRS.md (detailed requirements), TAD.md (architecture), DATABASE.md (data model), AI_ARCHITECTURE.md, MEMORY_ENGINE.md, SECURITY.md, PRIVACY.md.
 
 ## 1. Product summary
@@ -66,15 +66,23 @@ REIA must not become:
 
 ## 5. Target markets
 
-| Market | Country | Currency | Initial languages | Notes |
+| Market | Country (ISO code) | Currency | Initial languages | Notes |
 |---|---|---|---|---|
-| Dubai | AE | AED | English (Arabic planned) | Not the exclusive market |
-| Spain | ES | EUR | Spanish, English | GDPR applies |
-| Portugal | PT | EUR | Portuguese, English | GDPR applies |
+| Dubai | United Arab Emirates (AE) | AED | English (Arabic planned) | Dubai is a city, not a country; the jurisdiction is the UAE. Not the exclusive market |
+| Spain | Spain (ES) | EUR | Spanish, English | GDPR applies |
+| Portugal | Portugal (PT) | EUR | Portuguese, English | GDPR applies |
 
 - The three markets are considered from the architecture stage. Their legal, property and communication practices are not assumed to be identical.
 - A jurisdiction-specific compliance assessment is required before launching in each market (see PRIVACY.md). Technical security controls alone are not a compliance claim.
 - Market research and pilot feedback are kept separately per country.
+
+### Market sequencing (confirmed product decisions)
+
+- First pilot market: Dubai (United Arab Emirates, country code AE). Secondary validation markets: Spain and Portugal.
+- REIA remains a single international product supporting all three markets.
+- No pilot customer has been secured. A Dubai realtor took part in an initial discovery discussion. This is not a pilot commitment and not a paying customer, and it must not be presented as one.
+- Pilot target: 2 to 3 independent agents or small agency teams.
+- Spain and Portugal are validated separately before any commercial expansion there.
 
 ## 6. Target users
 
@@ -256,7 +264,7 @@ The standalone memory engine is built and validated before any integration work.
 
 | ID | Requirement | Priority |
 |---|---|---|
-| I18N-1 | Supported content languages: English, Spanish, Portuguese. Arabic and others later | M |
+| I18N-1 | UI languages at launch: English, Spanish, Portuguese. Conversation processing at launch: English, Spanish, Portuguese. An Arabic UI is not required at launch | M |
 | I18N-2 | UI language is a per-user setting; customer language is a per-customer setting | M |
 | I18N-3 | Language detection on import | M |
 | I18N-4 | Currencies AED and EUR at launch; any ISO 4217 currency supported through configuration; currency code stored separately from the amount | M |
@@ -265,6 +273,24 @@ The standalone memory engine is built and validated before any integration work.
 | I18N-7 | Localized number, date and time formatting; timezone-aware dates | M |
 | I18N-8 | Country configuration (currencies, languages, units, terminology) is added without changing core logic | M |
 | I18N-9 | No Dubai-specific assumptions hardcoded in core logic | M |
+| I18N-10 | Frontend architecture supports future right-to-left (RTL) layouts: logical CSS properties, no hardcoded left or right assumptions | M |
+| I18N-11 | Unicode (UTF-8) storage and processing everywhere; no English-only assumptions in database fields or interfaces | M |
+| I18N-12 | Conversation language detection is separate from UI language. Arabic conversation processing is a future capability, evaluated independently from Arabic UI localization | L |
+
+### 7.14 AI provider governance (PROV)
+
+| ID | Requirement | Priority |
+|---|---|---|
+| PROV-1 | Provider-independent interface; provider and model are selectable per task and per organization; no provider is hardcoded in business logic | M |
+| PROV-2 | OpenAI is the primary production provider for conversation analysis, fact extraction, memory generation and updates, customer Q&A, summaries, follow-up drafts, call briefings and embeddings | M |
+| PROV-3 | DeepSeek is restricted to development, experimentation, synthetic test data, public information and properly anonymized test content | M |
+| PROV-4 | Five data classes are distinct: `public`, `synthetic`, `anonymized`, `pseudonymized`, `identifiable`. Pseudonymized data is never automatically treated as anonymized. It is handled as identifiable customer data unless a documented anonymization assessment says otherwise | M |
+| PROV-5 | Restricted providers are deny-by-default for `pseudonymized` and `identifiable` data. Enabling one for real customer data requires all of: legal review of the jurisdiction, review of current contractual terms and privacy policy, assessment of international transfers and safeguards, data-processing agreements and security review, and explicit approval in the provider configuration | M |
+| PROV-6 | The restriction is enforced in three independent places: backend code policy, deployment configuration (credentials of a restricted provider are not provisioned in production unless approved under PROV-5), and per-organization settings. Per-organization settings can only narrow what code and deployment allow, never widen it | M |
+| PROV-7 | Every AI request, including embedding requests, passes the provider-policy check before it leaves the backend. Blocked requests are rejected and recorded | M |
+| PROV-8 | Logs record provider, model, endpoint, task, data class, timestamp and processing status, without unnecessarily logging sensitive prompt content | M |
+| PROV-9 | Before production, review current OpenAI API data controls, storage settings and Zero Data Retention eligibility per endpoint. Endpoints are not assumed to have identical retention behavior | M |
+| PROV-10 | The design allows region-specific providers to be added later | L |
 
 ## 8. Cross-cutting requirements
 
@@ -289,6 +315,40 @@ These are engineering targets, not guarantees. They are measured under a defined
 ### 8.3 Accessibility and UX principles
 
 Simple navigation, responsive layout, clear information hierarchy, accessible controls, consistent components, loading, error and empty states, and confirmation dialogs for sensitive actions. The interface is built to support additional languages and right-to-left scripts later.
+
+### 8.4 Data retention, deletion and subject rights (proposed defaults)
+
+The values below are **proposed REIA product-policy defaults** applied across the UAE (Dubai), Spain and Portugal. They are **not statutory retention periods** under UAE PDPL or GDPR, and REIA does not claim that those laws require these durations. **Legally verified requirements: none yet.** This section is updated with verified requirements only after a qualified, jurisdiction-specific privacy and legal review, which is required before production launch. PRIVACY.md is the authoritative document.
+
+| Data category | Proposed default | Status |
+|---|---|---|
+| Customer records and conversations | Kept while the customer workspace remains active, subject to purpose limitation and user controls | Proposed |
+| Production deletion after a verified deletion request | Within 30 days | Proposed |
+| Backup expiration after deletion | Within 35 additional days | Proposed |
+| Security and audit logs | 12 months | Proposed |
+| Legal hold | Only where legally required, documented and access-restricted | Proposed |
+
+#### Workspace lifecycle (proposed)
+
+- `active`: normal operation.
+- `dormant`: no member activity for a configurable inactivity period (the length is not set here and is decided with the legal review). The owner is notified. A dormant workspace is never deleted automatically without owner notice. Deletion starts only on the owner's confirmation or on termination. Whether continued retention of dormant data is justified is a legal review item.
+- `terminated`: the owner closes the workspace or the contract ends. Data export is available during a configurable export window (length not set yet). When the window ends, the deletion process starts as for a verified deletion request, unless a documented legal hold applies.
+
+#### Deletion requests, backups and the deletion ledger
+
+1. A deletion request (customer erasure or workspace deletion) is verified, then recorded in the deletion ledger before anything is deleted.
+2. Production data, including embeddings and other derived data, is erased within 30 days through the controlled erase functions (DATABASE.md section 7.2).
+3. Backups are immutable and are not edited per customer. Backup copies expire within 35 further days under the normal backup rotation.
+4. The deletion ledger records identifiers only, never personal data: subject type and id, organization id, verification and execution timestamps, and the date after which no backup can still hold the data. It is append-only and is also exported to a store separate from the database backups, so restoring a backup cannot roll it back.
+5. After any restore, the restore procedure must re-apply every ledger entry executed after the backup's snapshot time before the system is reopened to users. Restored data of a deleted subject must never become visible. Phase 12 tests this procedure.
+6. Ledger entries are kept at least until the last backup that could contain the subject has expired, plus a safety margin. Proposed: 12 months, the same as audit logs.
+7. Data held by AI providers is reviewed under PROV-9, and the deletion process documents what each provider retains.
+
+Other rules:
+- Retention is configurable where customer contracts or applicable law require different periods.
+- The product provides data export, correction, deletion and retention-management capabilities.
+- Personal data in technical logs is minimized.
+- Exceptions and legal holds are documented.
 
 ## 9. MVP definition
 
@@ -338,8 +398,9 @@ AI cost per processed conversation must be measured (`ai_runs.cost_usd`) before 
 | A2 | A multilingual embedding model gives acceptable cross-language retrieval for EN, ES and PT | ADR-007; measured in Phase 6 |
 | A3 | LLM providers return schema-valid structured output reliably enough with retries | Measured in Phase 5; fallbacks documented |
 | A4 | The pilot agents hold the right to process their customers' conversations | Consent and terms; PRIVACY.md |
-| A5 | EU-region hosting is acceptable for all three markets | Reviewed in compliance assessment |
+| A5 | The chosen hosting region is acceptable for each market. The Dubai pilot comes first, so UAE PDPL cross-border transfer rules must be assessed before a region is chosen | Reviewed in the compliance assessment; no hosting region is assumed in DATABASE.md or TAD.md |
 | A6 | Official WhatsApp and Pipedrive APIs permit the planned use | Investigated in Phase 11 before any commitment |
+| A7 | OpenAI API data controls and retention settings are acceptable for customer conversations | Reviewed before production, including Zero Data Retention eligibility (PROV-9, ADR-010) |
 
 ## 13. Risks
 
@@ -358,7 +419,7 @@ AI cost per processed conversation must be measured (`ai_runs.cost_usd`) before 
 
 ## 14. Market validation plan
 
-Do not assume Dubai, Spain and Portugal agents share workflows. For each country, research and record separately: CRM usage, WhatsApp usage, email patterns, relationship management practices, manual note-taking, follow-up workflows, language needs, willingness to pay, competing products and integration requirements. Pilot target: 3 to 5 authorized real estate professionals. Nothing in this document counts as market validation.
+Do not assume Dubai, Spain and Portugal agents share workflows. For each country, research and record separately: CRM usage, WhatsApp usage, email patterns, relationship management practices, manual note-taking, follow-up workflows, language needs, willingness to pay, competing products and integration requirements. Pilot target: 2 to 3 independent agents or small agency teams, starting in Dubai. No pilot customer is confirmed; a Dubai discovery discussion has taken place, which is not a pilot commitment. Spain and Portugal are validated separately before commercial expansion. Nothing in this document counts as market validation.
 
 ## 15. Acceptance criteria for a controlled pilot
 
@@ -375,13 +436,29 @@ REIA is ready for a pilot only when all of these hold:
 9. Critical automated tests, tenant-isolation tests and security tests pass; AI evaluation results are documented.
 10. Deployment and backup procedures are documented and tested; a jurisdiction-specific compliance assessment is complete for the pilot's market.
 
-## 16. Open questions
+## 16. Decision log and open questions
 
-1. Which pilot market goes first, and are pilot agents already identified?
-2. Final retention periods per country (PRIVACY.md).
-3. Which LLM provider handles which task, and is DeepSeek acceptable for customer data under each jurisdiction's rules?
-4. Is Arabic needed in the UI at launch, or only later?
-5. Embedding model and dimension (ADR-007).
+### 16.1 Decisions (Architecture Decision Addendum and review)
+
+| # | Decision | Status |
+|---|---|---|
+| 1 | Pilot market: Dubai (UAE) first; Spain and Portugal are secondary validation markets (ADR-012) | Confirmed |
+| 2 | Pilot size: 2 to 3 agents or small teams; none confirmed yet | Confirmed as a target only |
+| 3 | AI providers: OpenAI primary in production; DeepSeek restricted; five data classes; enforcement in code, deployment and organization settings (PROV-2 to PROV-7, ADR-010) | Confirmed |
+| 4 | Arabic: no Arabic UI at launch; RTL-ready frontend; Arabic conversation processing evaluated later (ADR-013) | Confirmed |
+| 5 | Embeddings: OpenAI `text-embedding-3-small`, 1536 dimensions, pgvector, cosine similarity (ADR-007) | Confirmed |
+| 6 | Retention values, workspace lifecycle, deletion ledger and backup propagation in section 8.4 (ADR-011) | Proposed defaults and design; legal review required |
+| 7 | Database roles `reia_migrator`, `reia_app`, `reia_maintenance`; no `DELETE` for the application role (ADR-014) | Proposed design |
+
+### 16.2 Still open
+
+1. Hosting region for each market, including the UAE PDPL cross-border transfer analysis for the Dubai pilot (A5).
+2. Qualified privacy and legal review of retention defaults, lawful basis, subprocessors, processor agreements, consent and international transfers, per jurisdiction.
+3. OpenAI endpoint data-retention settings and Zero Data Retention eligibility (A7, PROV-9).
+4. Whether DeepSeek is ever enabled for real customer data (requires all conditions in PROV-5).
+5. The conversation languages of the Dubai pilot agents (English only, or mixed with Arabic), and whether Arabic conversation processing must be evaluated sooner.
+6. The dormant-workspace inactivity period and the export window length (section 8.4).
+7. The separate append-only store for the deletion ledger and the restore runbook (defined in TAD.md and DEPLOYMENT.md, tested in Phase 12).
 
 ## 17. Glossary
 

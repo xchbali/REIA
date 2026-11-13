@@ -1,6 +1,6 @@
 # DATABASE.md — REIA Database Design
 
-Status: Draft v0.1 (Phase 0.1), pending review.
+Status: Draft v0.2 (Phase 0.1, updated with the Architecture Decision Addendum and review), pending review.
 Supersedes the 20-table sketch in URD §10. Changes are listed in §10.
 
 ## 1. Principles
@@ -57,6 +57,7 @@ erDiagram
   organizations ||--o{ integrations : connects
   integrations ||--o{ integration_sync_logs : logs
   organizations ||--o{ ai_runs : records
+  organizations ||--o{ organization_provider_settings : configures
   organizations ||--o{ processing_jobs : queues
   organizations ||--o{ audit_logs : audits
 ```
@@ -65,8 +66,9 @@ erDiagram
 
 ### 4.1 Database roles
 
-- `reia_migrator`: owns all tables, runs Alembic migrations. Never used by the running application.
-- `reia_app`: used by FastAPI. `NOSUPERUSER NOBYPASSRLS`. Not the table owner. Has only the privileges listed in §7.
+- `reia_migrator`: owns all tables and runs Alembic migrations and nothing else. Used only by the deployment pipeline. Never used by the running application or by scheduled jobs.
+- `reia_maintenance`: used only by the scheduled retention and deletion jobs. `NOSUPERUSER NOBYPASSRLS`, not a table owner. It has no direct `DELETE` on any table. It executes the controlled functions in section 7.2 and works per tenant through `app.current_org_id`, like the application.
+- `reia_app`: used by FastAPI. `NOSUPERUSER NOBYPASSRLS`. Not the table owner. Has only the privileges listed in section 7 and no `DELETE` on any table.
 
 ### 4.2 Row-Level Security
 
@@ -106,7 +108,8 @@ Notation: `*` = NOT NULL. Every tenant-owned table also has `organization_id*` a
 **organizations**
 - id*, name*, plan* (default `'pilot'`)
 - country* (ISO alpha-2), default_locale* (default `'en'`), default_currency* (ISO 4217), timezone* (IANA, e.g. `Europe/Madrid`)
-- settings* jsonb default `'{}'` (country-config overrides, validated by Pydantic)
+- settings* jsonb default `'{}'` (country-config overrides, retention overrides; validated by Pydantic)
+- lifecycle_status* (`active`, `dormant`, `terminated`; default `active`), terminated_at, export_window_ends_at
 - created_at*, updated_at*, deleted_at
 
 **users**
@@ -227,8 +230,10 @@ Notation: `*` = NOT NULL. Every tenant-owned table also has `organization_id*` a
 - id*, organization_id*, customer_id* (composite FK)
 - source_type* (`message`, `summary`, `fact`, `note`), source_id*, chunk_index* (default 0)
 - content*, content_language, content_hash*
-- embedding* `vector(1536)` (dimension set by ADR-007), embedding_model*, embedding_dimension*
-- UNIQUE (source_type, source_id, chunk_index, embedding_model)
+- embedding* `vector(1536)` (fixed by ADR-007), embedding_provider*, embedding_model*, embedding_model_version*, embedding_dimension* (CHECK = 1536)
+- embedding_model_version is a configured label (setting `EMBEDDING_MODEL_VERSION`, initial value `v1`), because a provider's model name can stay the same when its behavior changes
+- UNIQUE (source_type, source_id, chunk_index, embedding_model, embedding_model_version)
+- A different model or dimension never shares this column or its index. A model change follows the procedure in section 6.1.
 - Embeddings of rejected facts and erased customers are deleted by a cleanup job.
 
 ### 5.5 Work management
@@ -277,9 +282,31 @@ Notation: `*` = NOT NULL. Every tenant-owned table also has `organization_id*` a
 **ai_runs**
 - id*, organization_id*, customer_id, job_id
 - operation* (`extract`, `summarize`, `compare_facts`, `answer`, `draft`, `briefing`, `translate`, `embed`)
-- provider*, model*, prompt_name*, prompt_version*, input_hash* (no raw prompt text by default)
+- provider*, model*, endpoint (API endpoint used), data_class* (`public`, `synthetic`, `anonymized`, `pseudonymized`, `identifiable`), prompt_name*, prompt_version*, input_hash* (no raw prompt text by default)
 - input_tokens, output_tokens, cost_usd `numeric(10,6)`, latency_ms
-- status* (`succeeded`, `schema_invalid`, `provider_error`, `timeout`), error_code, error_details, created_at*
+- status* (`succeeded`, `schema_invalid`, `provider_error`, `timeout`, `blocked_by_policy`), error_code, error_details, created_at*
+
+**organization_provider_settings** (AI provider policy per organization and task)
+- id*, organization_id*
+- task* (`extract`, `summarize`, `compare_facts`, `answer`, `draft`, `briefing`, `translate`, `embed`)
+- provider*, model*, enabled* (default true)
+- allowed_data_classes* (`text[]`, subset of `public`, `synthetic`, `anonymized`, `pseudonymized`, `identifiable`)
+- approval_reference, approved_by, approved_at (required when `allowed_data_classes` includes `pseudonymized` or `identifiable` and the provider is flagged restricted in code)
+- created_at*, updated_at*
+- UNIQUE (organization_id, task)
+- The restricted-provider list lives in code (`app/ai/provider_policy.py`). Restricted providers are deny-by-default for `pseudonymized` and `identifiable` data. A request is sent only when all three agree: (1) the code policy, (2) the deployment configuration (`AI_RESTRICTED_PROVIDERS_ALLOWED_FOR_CUSTOMER_DATA`, empty by default; credentials of a restricted provider are not provisioned in production unless approved), and (3) this row. This row can only narrow what code and deployment allow, never widen it.
+- Pseudonymized data is never treated as anonymized automatically. It is handled as `identifiable` unless a documented anonymization assessment says otherwise.
+- Every AI call, including embedding calls, is checked before sending. The result is recorded in `ai_runs` (`provider`, `model`, `endpoint`, `data_class`). Blocked calls are recorded with `status = 'blocked_by_policy'`.
+
+**deletion_ledger** (append-only; identifiers only; no foreign key to organizations, so deleting a workspace cannot delete its ledger rows)
+- id*, organization_id* (plain uuid)
+- subject_type* (`customer`, `workspace`), subject_id*
+- request_reference*, requested_by, verified_by*, verified_at*
+- status* (`verified`, `executing`, `executed`, `failed`), executed_at
+- backup_expiry_at (the earliest date after which no backup can contain the subject, computed from the backup rotation)
+- created_at*
+- No personal data is stored. Rows are also exported to an append-only store that is separate from the database backups (ADR-011), so a restore cannot roll the ledger back.
+- RLS: `reia_app` sees only its current organization. A dedicated policy lets `reia_maintenance` list pending entries across organizations, because the table holds identifiers only. Every other table stays tenant-scoped for it.
 
 **integrations**
 - id*, organization_id*, provider* (`pipedrive`, `whatsapp_business`, `gmail`, `outlook`)
@@ -311,11 +338,32 @@ Notation: `*` = NOT NULL. Every tenant-owned table also has `organization_id*` a
 - customer_facts: `(organization_id, customer_id, lifecycle_status)`, `(organization_id, customer_id, fact_key)`, plus the partial unique index above.
 - customer_memory_events: `(organization_id, customer_id, occurred_at DESC)`.
 - tasks: `(organization_id, assigned_user_id, status, due_at)`.
-- memory_embeddings: btree `(organization_id, customer_id)` plus HNSW `USING hnsw (embedding vector_cosine_ops)`.
+- memory_embeddings: btree `(organization_id, customer_id)` plus a partial HNSW index for the active model and version: `USING hnsw (embedding vector_cosine_ops) WHERE embedding_model = 'text-embedding-3-small' AND embedding_model_version = 'v1'`. The predicate uses the real configured values, never a placeholder. Retrieval queries always filter on the active model and version with inline literals taken from an allowlist in configuration, because a parameterized predicate can stop the planner from using a partial index. A test checks the plan with EXPLAIN.
   - pgvector HNSW filters after the index scan, so for per-customer queries we enable iterative scans (`hnsw.iterative_scan`) and verify recall in the Phase 6 evaluation.
   - HNSW supports up to 2000 dimensions for `vector`. A larger model needs `halfvec` or reduced dimensions.
 - processing_jobs: `(status, scheduled_at)`.
 - audit_logs: `(organization_id, created_at DESC)`.
+
+### 6.1 Embedding model versions, re-embedding and index migration
+
+Configuration: `EMBEDDING_PROVIDER=openai`, `EMBEDDING_MODEL=text-embedding-3-small`, `EMBEDDING_DIMENSION=1536`, `EMBEDDING_MODEL_VERSION=v1`. The label `v1` is a REIA-maintained label for the initial configuration, and the partial index in section 6 uses these same literal values. At startup the application checks that the partial index for the active label exists and refuses to serve retrieval if it does not.
+
+Procedure for changing the model, dimension or version label:
+1. Record a new ADR that supersedes ADR-007, with the reason and the quality thresholds the new model must meet.
+2. Add the new label to configuration as inactive. A different dimension needs a new column or table, never the existing `vector(1536)` column.
+3. Add an Alembic migration that creates the new partial HNSW index (`CREATE INDEX CONCURRENTLY`, run outside a transaction block).
+4. Run the idempotent `re_embed` job in batches. It is rate limited, passes the provider-policy check (ADR-010) and records cost in `ai_runs`. The unique key includes model and version, so reruns never duplicate rows.
+5. Run the evaluation set (English, Spanish, Portuguese, including cross-language queries) against the new label and compare with the recorded baseline. The switch is blocked unless the thresholds from step 1 are met.
+6. Switch the active label through configuration in a normal deployment.
+7. Keep the old vectors and index for a rollback window. Rollback means setting the previous label active again.
+8. After verification, a later migration drops the old index and the old vectors.
+
+Tests (listed in TESTING.md):
+- Inserting a vector with a wrong dimension is rejected by the database.
+- A query without the active model and version filter fails a unit test of the query builder.
+- EXPLAIN shows the partial index is used for the retrieval query.
+- The `re_embed` job is idempotent.
+- The retrieval-quality regression test runs on every model or label change and compares the results with the stored baseline.
 
 ## 7. Immutability, privileges and retention
 
@@ -324,19 +372,26 @@ Notation: `*` = NOT NULL. Every tenant-owned table also has `organization_id*` a
 - `conversation_messages`, `message_translations`, `customer_memory_events`, `fact_corrections`, `audit_logs`: `INSERT, SELECT` only. No `UPDATE` or `DELETE`.
 - `conversations`: `INSERT, SELECT`, and column-level `UPDATE (customer_id, processing_status, detected_language)`. `original_content` and `content_hash` can never be updated. No `DELETE`.
 - `customer_facts`: `INSERT, SELECT, UPDATE (lifecycle_status, verification_status, valid_to, updated_at)`. Values are never edited in place. A correction is a new row. No `DELETE`.
-- Other tables: normal `SELECT, INSERT, UPDATE`. `DELETE` only where listed in §7.3.
+- Other tables: `SELECT, INSERT, UPDATE` as the module needs. `reia_app` has no `DELETE` on any table. Expired or consumed rows, such as tokens, are removed by the maintenance functions in section 7.2.
+- `deletion_ledger`: `reia_app` has `INSERT` and `SELECT` only (it records verified deletion requests and cannot change or delete them). `reia_maintenance` has `SELECT` and column-level `UPDATE (status, executed_at, backup_expiry_at)`.
+- `reia_maintenance` has `EXECUTE` on `erase_customer`, `erase_workspace`, `purge_expired_audit_logs` and `purge_expired_tokens`, and no other write privilege.
 
 ### 7.2 Erasure
 
-Hard deletion of a customer's data (data-subject erasure request, account deletion) runs through a single `SECURITY DEFINER` function, `erase_customer(org_id, customer_id)`, owned by `reia_migrator`. It:
+Hard deletion runs only through `SECURITY DEFINER` functions owned by `reia_migrator`: `erase_customer(org_id, customer_id)` for one customer and `erase_workspace(org_id)` for a whole workspace. The deletion job calls them under `reia_maintenance`. `EXECUTE` is revoked from `PUBLIC` and granted to `reia_maintenance` only, and each function sets a fixed `search_path`. `erase_customer`:
 1. Deletes embeddings, facts, summaries, translations, messages, conversations, drafts, briefings, tasks and commitments for that customer.
-2. Writes an `audit_logs` row (ids only).
-3. Cannot be called for a customer outside the current tenant.
+2. Writes an `audit_logs` row (ids only) and marks the matching `deletion_ledger` entry executed.
+3. Raises an error unless `app.current_org_id` equals `org_id`, so it cannot act outside the tenant context set by the job. `erase_workspace` performs the same check and also removes the organization's members, integrations and settings. Neither function touches `deletion_ledger` rows except to mark them executed.
 
 ### 7.3 Retention and deletion
 
 - Customers use soft delete (`deleted_at`). Soft-deleted data is excluded from search and retrieval.
-- Retention periods per jurisdiction are defined in PRIVACY.md and are not guessed here.
+- Proposed product defaults (PRD.md section 8.4 and PRIVACY.md are authoritative; these are NOT statutory periods under UAE PDPL or GDPR, and no legally verified retention requirement exists yet): customer records and conversations are kept while the workspace is active; production deletion within 30 days of a verified deletion request; backups expire within a further 35 days; security and audit logs are kept for 12 months; legal holds apply only where legally required, documented and access-restricted.
+- Workspace lifecycle is stored in `organizations.lifecycle_status`: `active`, `dormant` (inactive for a configurable period, owner notified, never deleted automatically) and `terminated` (export window, then the deletion process). The dormant period and the export window are not set yet.
+- Deletion ledger: every verified deletion request is written to `deletion_ledger` before anything is deleted, and the ledger is exported to an append-only store separate from the database backups. Backups are immutable and are not edited per customer; they expire within 35 days under normal rotation. After any restore, the restore procedure re-applies every ledger entry executed after the snapshot time before users are let back in, so a restored backup cannot bring deleted data back. Phase 12 tests this.
+- Retention is configurable per organization through `organizations.settings` (validated by Pydantic) where a contract or law requires different periods.
+- Audit log retention (12 months) is enforced by `purge_expired_audit_logs`, run by `reia_maintenance`. `reia_app` has no `DELETE` on `audit_logs`.
+- Technical logs and `audit_logs.metadata` contain identifiers only, never message content or contact details.
 - Account deletion and data export are implemented in Phase 2 (account) and Phase 12 (verification).
 - Backups are encrypted. Restore must be tested (Phase 12).
 
@@ -356,9 +411,12 @@ Hard deletion of a customer's data (data-subject erasure request, account deleti
 - ADR-004: `text` plus `CHECK` instead of Postgres enums.
 - ADR-005: Money, area and location are structured fields, not free text.
 - ADR-006: Originals immutable through privileges, not only through code.
-- ADR-007 (pending): embedding model and dimension. Default `text-embedding-3-small` at 1536. Confirm current options in Phase 6.
+- ADR-007 (confirmed): OpenAI `text-embedding-3-small`, 1536 dimensions, pgvector, cosine similarity. Model, dimension and version label are stored with every embedding, and re-embedding follows section 6.1. Retrieval quality for English, Spanish and Portuguese is measured in Phase 6. Changing the model requires a new ADR.
 - ADR-008: Country defaults in YAML (`app/config/countries/`), per-organization overrides in `organizations.settings`. No separate country table.
 - ADR-009: Identity: one active identifier belongs to one customer. Merges are manual and recorded.
+- ADR-010 (confirmed): AI provider policy. Five distinct data classes; restricted providers are deny-by-default for `pseudonymized` and `identifiable` data; enforced in backend code, deployment configuration and per-organization settings; embedding requests are included.
+- ADR-011 (proposed defaults, legal review required): retention defaults, workspace lifecycle, deletion ledger and backup propagation (sections 5.6 and 7.3).
+- ADR-014 (proposed): database roles `reia_migrator`, `reia_app` and `reia_maintenance`; the application role has no `DELETE` (sections 4.1 and 7).
 
 ## 10. Changes from the URD sketch
 
@@ -379,10 +437,14 @@ Hard deletion of a customer's data (data-subject erasure request, account deleti
 | Added `organization_id` to `integration_sync_logs` | RLS coverage |
 | Added `embedding_model`, `embedding_dimension` | Model can change later |
 | Added country, locale, currency, timezone to organizations | International configuration |
+| Added `organization_provider_settings`; added `endpoint` and `data_class` to `ai_runs`; added `blocked_by_policy` status | Provider restrictions and logging (ADR-010) |
+| Added `deletion_ledger` and `organizations.lifecycle_status`; added the `reia_maintenance` role; removed `DELETE` from `reia_app` | Deletion propagation to backups and least privilege (ADR-011, ADR-014) |
+| Added `embedding_provider` and `embedding_model_version`; partial HNSW index per model and version | ADR-007; safe re-embedding |
 
 ## 11. Open items
 
-- Final retention periods per country (PRIVACY.md).
+- Legal verification of the retention defaults per country (PRIVACY.md). The values in section 7.3 are proposals. The dormant-workspace period and the export window are not set yet.
+- Storage location of the separate append-only deletion ledger copy and the restore runbook (TAD.md, DEPLOYMENT.md).
 - Attachments (files, audio): out of MVP scope. A table is added when needed.
 - Whether `platform_admin` access needs a separate audited access path.
 - Confirm multilingual full-text behavior (`regconfig` generated column) in the Phase 4 migration test.
